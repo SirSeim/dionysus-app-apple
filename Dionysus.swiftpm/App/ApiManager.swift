@@ -10,96 +10,138 @@ struct LoginSuccess: Codable {
     var token: String
 }
 
+struct ErrorResponse: Codable {
+    var detail: String
+}
+
+enum CallErrorType {
+    case unknown
+    case notLoggedIn
+    case unexpectedRequest
+    case unexpectedResponse
+    case badRequest
+    case unauthorized
+    case serverError
+}
+
+struct CallError {
+    var type: CallErrorType
+    var detail: String
+}
+
 enum DateError: String, Error {
-    case invlidDate
+    case invalidDate
 }
 
 struct EmptyPayload: Codable {}
 
 class ApiManager {
-    let host = "http://localhost:8000"
+    let host = "https://dionysus.seim.io"
     
     func loggedIn() -> Bool {
-        let token = token()
-        if token == nil {
+        guard let token = token() else {
             return false
         }
-        return token!.count > 0
+        return token.count > 0
     }
     
     func token() -> String? {
         return  KeychainHelper.standard.read(service: "dionysus", account: "auth-token", type: String.self)
     }
     
-    func getData<T: Decodable>(urlString: String, ensureTokenSet: Bool = true, success: @escaping ((T) -> Void), fail: @escaping (() -> Void)) {
+    func getURLSession() -> URLSession {
+        let sessionConfig = URLSessionConfiguration.default
+        sessionConfig.httpAdditionalHeaders = [
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        ]
+        if loggedIn() {
+            sessionConfig.httpAdditionalHeaders!["Authorization"] = "Token \(token()!)"
+        }
+        return URLSession(configuration: sessionConfig)
+    }
+    
+    func getResponseData<T: Decodable>(_ type: T.Type, from: Data) throws -> T {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = .custom({ (decoder) -> Date in
+            let container = try decoder.singleValueContainer()
+            let dateStr = try container.decode(String.self)
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX"
+            if let date = formatter.date(from: dateStr) {
+                return date
+            }
+            throw DateError.invalidDate
+        })
+        return try decoder.decode(type, from: from)
+    }
+    
+    func formatError(response: HTTPURLResponse, data: Data) -> CallError {
+        print("error statusCode \(response.statusCode):", String(data: data, encoding: .utf8) ?? "")
+        let decodedError: ErrorResponse
+        do {
+            decodedError = try self.getResponseData(ErrorResponse.self, from: data)
+        } catch let error {
+            print("error decoding error response \(error)")
+            return CallError(type: .unexpectedResponse, detail: "error decoding error response")
+        }
+        
+        let errorType: CallErrorType
+        switch response.statusCode {
+        case 400:
+            errorType = .badRequest
+        case 401:
+            errorType = .unauthorized
+        case 500:
+            errorType = .serverError
+        default:
+            errorType = .unknown
+        }
+        return CallError(type: errorType, detail: decodedError.detail)
+    }
+    
+    func getData<T: Decodable>(urlString: String, ensureTokenSet: Bool = true, success: @escaping ((T) -> Void), fail: @escaping ((CallError) -> Void)) {
         guard let url = URL(string: "\(host)\(urlString)") else {
             print("error URL: \(urlString)")
             return
         }
         
         if ensureTokenSet && !loggedIn() {
-            fail()
+            fail(CallError(type: .notLoggedIn, detail: "not logged in when required for call"))
             return
         }
         
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.httpAdditionalHeaders = [
-            "Accept": "application/json",
-        ]
-        if loggedIn() {
-            sessionConfig.httpAdditionalHeaders!["Authorization"] = "Token \(token()!)"
-        }
-        let session = URLSession(configuration: sessionConfig)
-        
+        let session = getURLSession()
         session.dataTask(with: url) { data, response, error in
             guard let httpResponse = response as? HTTPURLResponse else {
                 print("could not format HttpResponse")
-                fail()
+                fail(CallError(type: .unexpectedResponse, detail: "could not format HttpResponse"))
                 return
             }
             
-            guard let data = data else { return }
+            guard let data = data else {
+                fail(CallError(type: .unexpectedResponse, detail: "no data returned from server"))
+                return
+            }
             if httpResponse.statusCode != 200 {
-                print("error statusCode \(httpResponse.statusCode):", String(data: data, encoding: .utf8) ?? "")
-                fail()
+                fail(self.formatError(response: httpResponse, data: data))
                 return
             }
             
             do {
-                let decoder = JSONDecoder()
-                decoder.keyDecodingStrategy = .convertFromSnakeCase
-                let decodedData = try decoder.decode(T.self, from: data)
+                let decodedData = try self.getResponseData(T.self, from: data)
                 DispatchQueue.main.async {
                     success(decodedData)
                 }
             } catch let error {
                 print(error)
-                fail()
+                fail(CallError(type: .unexpectedResponse, detail: "error decoding successful response"))
             }
         }.resume()
     }
     
-    func postData<T: Decodable, Y: Encodable>(urlString: String, data: Y, ensureTokenSet: Bool = true, success: @escaping ((T) -> Void), fail: @escaping (() -> Void)) {
-        guard let url = URL(string: "\(host)\(urlString)") else {
-            print("error URL: \(urlString)")
-            return
-        }
-        
-        if ensureTokenSet && !loggedIn() {
-            fail()
-            return
-        }
-        
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.httpAdditionalHeaders = [
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        ]
-        if loggedIn() {
-            sessionConfig.httpAdditionalHeaders!["Authorization"] = "Token \(token()!)"
-        }
-        let session = URLSession(configuration: sessionConfig)
-        
+    func createPostRequest<T: Encodable>(url: URL, data: T) -> URLRequest? {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         
@@ -109,111 +151,104 @@ class ApiManager {
             request.httpBody = try encoder.encode(data)
         } catch let error {
             print("error json serialize:", error)
+            return nil
+        }
+        return request
+    }
+    
+    func postData<T: Decodable, Y: Encodable>(urlString: String, data: Y, ensureTokenSet: Bool = true, success: @escaping ((T) -> Void), fail: @escaping ((CallError) -> Void)) {
+        guard let url = URL(string: "\(host)\(urlString)") else {
+            print("error URL: \(urlString)")
+            return
+        }
+        if ensureTokenSet && !loggedIn() {
+            fail(CallError(type: .notLoggedIn, detail: "not logged in when required for call"))
             return
         }
         
+        let session = getURLSession()
+        guard let request = createPostRequest(url: url, data: data) else {
+            fail(CallError(type: .unexpectedRequest, detail: "error encoding payload"))
+            return
+        }
         session.dataTask(with: request) { data, response, error in
             guard let httpResponse = response as? HTTPURLResponse else {
                 print("could not format HttpResponse")
-                fail()
+                fail(CallError(type: .unexpectedResponse, detail: "could not format HttpResponse"))
                 return
             }
             
-            guard let data = data else { return }
+            guard let data = data else {
+                fail(CallError(type: .unexpectedResponse, detail: "no data returned from server"))
+                return
+            }
             if httpResponse.statusCode != 200 {
-                print("error statusCode \(httpResponse.statusCode):", String(data: data, encoding: .utf8) ?? "")
-                fail()
+                fail(self.formatError(response: httpResponse, data: data))
                 return
             }
             
             do {
-                let decoder = JSONDecoder()
-                decoder.keyDecodingStrategy = .convertFromSnakeCase
-                decoder.dateDecodingStrategy = .custom({ (decoder) -> Date in
-                    let container = try decoder.singleValueContainer()
-                    let dateStr = try container.decode(String.self)
-                    let formatter = DateFormatter()
-                    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX"
-                    if let date = formatter.date(from: dateStr) {
-                        return date
-                    }
-                    throw DateError.invlidDate
-                })
-                let decodedData = try decoder.decode(T.self, from: data)
+                let decodedData = try self.getResponseData(T.self, from: data)
                 DispatchQueue.main.async {
                     success(decodedData)
                 }
             } catch let error {
                 print(error)
-                fail()
+                fail(CallError(type: .unexpectedResponse, detail: "error decoding successful response"))
             }
         }.resume()
     }
     
-    func postDataWithoutResponse<T: Encodable>(urlString: String, data: T, ensureTokenSet: Bool = true, success: @escaping (() -> Void), fail: @escaping (() -> Void)) {
+    func postDataWithoutResponse<T: Encodable>(urlString: String, data: T, ensureTokenSet: Bool = true, success: @escaping (() -> Void), fail: @escaping ((CallError) -> Void)) {
         guard let url = URL(string: "\(host)\(urlString)") else {
             print("error URL: \(urlString)")
             return
         }
-        
         if ensureTokenSet && !loggedIn() {
-            fail()
+            fail(CallError(type: .notLoggedIn, detail: "not logged in when required for call"))
             return
         }
         
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.httpAdditionalHeaders = [
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        ]
-        if loggedIn() {
-            sessionConfig.httpAdditionalHeaders!["Authorization"] = "Token \(token()!)"
-        }
-        let session = URLSession(configuration: sessionConfig)
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        
-        do {
-            let encoder = JSONEncoder()
-            encoder.keyEncodingStrategy = .convertToSnakeCase
-            request.httpBody = try encoder.encode(data)
-        } catch let error {
-            print("error json serialize:", error)
+        let session = getURLSession()
+        guard let request = createPostRequest(url: url, data: data) else {
+            fail(CallError(type: .unexpectedRequest, detail: "error encoding payload"))
             return
         }
-        
         session.dataTask(with: request) { data, response, error in
             guard let httpResponse = response as? HTTPURLResponse else {
                 print("could not format HttpResponse")
-                fail()
+                fail(CallError(type: .unexpectedResponse, detail: "could not format HttpResponse"))
                 return
             }
             
-            guard let data = data else { return }
             if httpResponse.statusCode != 204 {
-                print("error statusCode \(httpResponse.statusCode):", String(data: data, encoding: .utf8) ?? "")
-                fail()
+                guard let data = data else {
+                    fail(CallError(type: .unexpectedResponse, detail: "no data returned from server"))
+                    return
+                }
+                fail(self.formatError(response: httpResponse, data: data))
                 return
             }
             
-            success()
+            DispatchQueue.main.async {
+                success()
+            }
         }.resume()
     }
     
     func loadAdditions(success: @escaping ([Addition]) -> Void) {
         getData(urlString: "/api/v1/addition/") { (results: AdditionResults) in
             success(results.results)
-        } fail: {
-            print("failed to get additions")
+        } fail: { error in
+            print("failed to get additions \(error)")
         }
     }
     
     func loadProfile(success: @escaping (Profile) -> Void) {
         getData(urlString: "/api/v1/auth/account/") { (profile: Profile) in
             success(profile)
-        } fail: {
-            print("failed to get profile")
+        } fail: { error in
+            print("failed to get profile: \(error)")
         }
     }
     
@@ -222,8 +257,8 @@ class ApiManager {
         postData(urlString: "/api/v1/auth/login/", data: payload, ensureTokenSet: false) { (result: LoginSuccess) in
             KeychainHelper.standard.save(item: result.token, service: "dionysus", account: "auth-token")
             success()
-        } fail: {
-            print("failed to login")
+        } fail: { error in
+            print("failed to login: \(error)")
         }
     }
     
@@ -232,8 +267,11 @@ class ApiManager {
             KeychainHelper.standard.delete(service: "dionysus", account: "auth-token")
             print("logged out")
             success()
-        } fail: {
-            print("failed to logout")
+        } fail: { error in
+            KeychainHelper.standard.delete(service: "dionysus", account: "auth-token")
+            print("failed to logout: \(error)")
+            // allow caller code to proceed since token is gone
+            success()
         }
     }
 }
